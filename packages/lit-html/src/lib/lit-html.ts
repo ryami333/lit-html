@@ -40,10 +40,8 @@ const isPrimitive = (value: unknown): value is Primitive =>
   value === null || !(typeof value === 'object' || typeof value === 'function');
 
 /**
- * This regex extracts the attribute name preceding an attribute-position
- * expression. It does this by matching the syntax allowed for attributes
- * against the string literal directly preceding the expression, assuming that
- * the expression is in an attribute-value position.
+ * The tagEnd regex matches the end of the "inside an opening" tag syntax
+ * position. It either matches a `>` or an attribute.
  *
  * See attributes in the HTML spec:
  * https://www.w3.org/TR/html5/syntax.html#elements-attributes
@@ -65,7 +63,14 @@ const isPrimitive = (value: unknown): value is Primitive =>
  *    * (") then any non-("), or
  *    * (') then any non-(')
  */
-const lastAttributeNameRegex = /([ \x09\x0a\x0c\x0d])([^\0-\x1F\x7F-\x9F "'>=/]+)([ \x09\x0a\x0c\x0d]*=[ \x09\x0a\x0c\x0d]*(?:[^ \x09\x0a\x0c\x0d"'`<>=]*|"[^"]*|'[^']*))$/;
+
+// These regex strings are used in the HTML scanner in Template. Keep them as
+// top-level variables. Terser will not inline them into a regex literal if
+// they are declared in the Template constructor.
+const SPACE_CHAR = `[ \\x09\\x0a\\x0c\\x0d]`;
+const ATTR_VALUE_CHAR = `[^ \\x09\\x0a\\x0c\\x0d"'\`<>=]`;
+const NAME_CHAR = `[^\\0-\\x1F\\x7F-\\x9F "'>=/]`;
+const TAG_END = `>|${SPACE_CHAR}(${NAME_CHAR}+)(${SPACE_CHAR}*=${SPACE_CHAR}*(?:${ATTR_VALUE_CHAR}|("|')|$))`;
 
 /**
  * Matches the raw text elements.
@@ -184,8 +189,7 @@ class Template {
   __parts: Array<TemplatePart> = [];
 
   constructor({strings, _$litType$: type}: TemplateResult) {
-    this.__element = d.createElement('template');
-    walker.currentNode = this.__element.content;
+    walker.currentNode = (this.__element = d.createElement('template')).content;
 
     // Insert makers into the template HTML to represent the position of
     // bindings. The following code scans the template strings to determine the
@@ -194,6 +198,7 @@ class Template {
     // sentinel string and re-write the attribute name, or inside a tag where
     // we insert the sentinel string.
     const l = (this.__strings = strings).length - 1;
+    const attrNames: Array<string> = [];
 
     // These regexes represent the five parsing states that we care about and
     // match the end of the state. Depending on the match, we transition to a
@@ -205,33 +210,36 @@ class Template {
 
     const textRegex = /<((?:!--)|(?:\w*))/g;
     const commentRegex = /-->/g;
-    const tagRegex = /(>)|(?:(?:[ \x09\x0a\x0c\x0d])([^\0-\x1F\x7F-\x9F "'>=/]+)([ \x09\x0a\x0c\x0d]*=[ \x09\x0a\x0c\x0d]*([^ \x09\x0a\x0c\x0d"'`<>=]|("|')|$)))/g;
+    const tagRegex = new RegExp(TAG_END, 'g');
     const singleQuoteAttr = /'/g;
     const doubleQuoteAttr = /"/g;
 
     let html = type === 2 ? '<svg>' : '';
-    let quote: string | undefined = undefined;
     let node: Node | null;
     let nodeIndex = 0;
     let bindingIndex = 0;
+    let attrNameIndex = 0;
 
     // The current parsing state, represented as a reference to one of the
     // regexes
     let regex = textRegex;
 
-    for (let i = 0; i < strings.length - 1; i++) {
+    for (let i = 0; i < l; i++) {
       const s = strings[i];
       let attrNameEnd = -1;
+      let attrName: string | undefined = undefined;
       let lastIndex = 0;
+      let match: RegExpExecArray | null;
 
       // The conditions in this loop handle the current parse state, and the
       // assignments to the `regex` variable are the state transitions.
       while (lastIndex < s.length) {
         // Make sure we start searching from where we previously left off
         regex.lastIndex = lastIndex;
-        const match = regex.exec(s);
+        match = regex.exec(s);
         if (match === null) {
-          if (quote === undefined) {
+          // TODO (justfagnani): add test coverage from spread parts
+          if (regex !== singleQuoteAttr && regex !== doubleQuoteAttr) {
             attrNameEnd = -1;
           }
           break;
@@ -249,29 +257,24 @@ class Template {
               regex = tagRegex;
             }
           }
-        } else if (regex === commentRegex) {
-          regex = textRegex;
-        } else if (
-          regex === tagRegex ||
-          regex === doubleQuoteAttr ||
-          regex === singleQuoteAttr
-        ) {
-          if (match[1] === '>') {
+        } else if (regex === tagRegex) {
+          if (match[0] === '>') {
             regex = textRegex;
-          } else if (quote && (match[0] === '"' || match[0] === "'")) {
-            // End quoted attribute
-            attrNameEnd = -1;
-            regex = tagRegex;
           } else {
-            attrNameEnd = regex.lastIndex - match[3].length;
-            quote = match[5];
+            attrNameEnd = regex.lastIndex - match[2].length;
+            attrName = match[1];
             regex =
-              quote === undefined
+              match[3] === undefined
                 ? tagRegex
-                : quote === '"'
+                : match[3] === '"'
                 ? doubleQuoteAttr
                 : singleQuoteAttr;
           }
+        } else if (regex === doubleQuoteAttr || regex === singleQuoteAttr) {
+          attrNameEnd = -1;
+          regex = tagRegex;
+        } else if (regex === commentRegex) {
+          regex = textRegex;
         } else {
           // Not one of the five state regexes, so we're at the close of a raw a
           // text element.
@@ -279,13 +282,14 @@ class Template {
         }
       }
 
-      html +=
-        regex === textRegex
-          ? s + nodeMarker
-          : (attrNameEnd === -1
-              ? s
-              : s.slice(0, attrNameEnd) + '$lit$' + s.slice(attrNameEnd)) +
-            marker;
+      // console.assert(!(attrNameEnd !== -1 && regex === textRegex));
+      if (attrNameEnd !== -1) {
+        attrNames.push(attrName!);
+        html +=
+          s.slice(0, attrNameEnd) + '$lit$' + s.slice(attrNameEnd) + marker;
+      } else {
+        html += regex === textRegex ? s + nodeMarker : s + marker;
+      }
     }
     this.__element.innerHTML =
       html + this.__strings[l] + (type === 2 ? '</svg>' : '');
@@ -311,9 +315,7 @@ class Template {
               this.__parts.push({
                 type: ATTRIBUTE_PART,
                 index: nodeIndex,
-                // TODO (justinfagnani): remove this regex by storing the name
-                // during HTML scanning
-                name: lastAttributeNameRegex.exec(strings[bindingIndex])![2],
+                name: attrNames[attrNameIndex++],
                 strings: statics,
               });
               bindingIndex += statics.length - 1;
@@ -406,7 +408,7 @@ class TemplateInstance {
         if (templatePart.type === NODE_PART) {
           part = new NodePart(node as HTMLElement, node.nextSibling, options);
         } else if (templatePart.type === ATTRIBUTE_PART) {
-          const [, prefix, name] = templatePart.name.match(/(\.|\?|@)?(.*)/)!;
+          const [, prefix, name] = /([.?@])?(.*)/.exec(templatePart.name)!;
           const ctor =
             prefix === '.'
               ? PropertyPart
